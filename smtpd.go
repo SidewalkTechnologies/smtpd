@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"log"
 	"net"
 	"strings"
@@ -55,10 +56,10 @@ type Server struct {
 
 	// mu guards doneChan and makes closing it and listener atomic from
 	// perspective of Serve()
-	mu sync.Mutex
-	doneChan chan struct{}
-	listener *net.Listener
-	waitgrp sync.WaitGroup
+	mu         sync.Mutex
+	doneChan   chan struct{}
+	listener   *net.Listener
+	waitgrp    sync.WaitGroup
 	inShutdown atomicBool // true when server is in shutdown
 }
 
@@ -75,13 +76,14 @@ const (
 
 // Peer represents the client connecting to the server
 type Peer struct {
-	HeloName   string               // Server name used in HELO/EHLO command
-	Username   string               // Username from authentication, if authenticated
-	Password   string               // Password from authentication, if authenticated
-	Protocol   Protocol             // Protocol used, SMTP or ESMTP
-	ServerName string               // A copy of Server.Hostname
-	Addr       net.Addr             // Network address
-	TLS        *tls.ConnectionState // TLS Connection details, if on TLS
+	HeloName     string               // Server name used in HELO/EHLO command
+	Username     string               // Username from authentication, if authenticated
+	Password     string               // Password from authentication, if authenticated
+	Protocol     Protocol             // Protocol used, SMTP or ESMTP
+	ServerName   string               // A copy of Server.Hostname
+	Addr         net.Addr             // Network address
+	TLS          *tls.ConnectionState // TLS Connection details, if on TLS
+	ConnectionID string               // UUID for each connection
 }
 
 // Error represents an Error reported in the SMTP session.
@@ -120,8 +122,9 @@ func (srv *Server) newSession(c net.Conn) (s *session) {
 		reader: bufio.NewReader(c),
 		writer: bufio.NewWriter(c),
 		peer: Peer{
-			Addr:       c.RemoteAddr(),
-			ServerName: srv.Hostname,
+			ConnectionID: uuid.NewString(),
+			Addr:         c.RemoteAddr(),
+			ServerName:   srv.Hostname,
 		},
 	}
 
@@ -228,7 +231,7 @@ func (srv *Server) Shutdown(wait bool) error {
 	// First close the listener
 	srv.mu.Lock()
 	if srv.listener != nil {
-		lnerr = (*srv.listener).Close();
+		lnerr = (*srv.listener).Close()
 	}
 	srv.closeDoneChanLocked()
 	srv.mu.Unlock()
@@ -254,7 +257,7 @@ func (srv *Server) Wait() error {
 
 // Address returns the listening address of the server
 func (srv *Server) Address() net.Addr {
-	return (*srv.listener).Addr();
+	return (*srv.listener).Addr()
 }
 
 func (srv *Server) configureDefaults() {
@@ -432,7 +435,6 @@ func (session *session) close() {
 	time.Sleep(200 * time.Millisecond)
 	session.conn.Close()
 }
-
 
 // From net/http/server.go
 
