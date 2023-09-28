@@ -2,10 +2,9 @@ package smtpd_test
 
 import (
 	"errors"
+	"github.com/SidewalkTechnologies/smtpd"
 	"net/smtp"
 	"strings"
-
-	"github.com/chrj/smtpd"
 )
 
 func ExampleServer() {
