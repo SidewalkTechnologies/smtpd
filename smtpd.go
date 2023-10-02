@@ -15,6 +15,10 @@ import (
 	"time"
 )
 
+type Log interface {
+	Printf(format string, v ...interface{})
+}
+
 // Server defines the parameters for running the SMTP server
 type Server struct {
 	Hostname       string // Server hostname. (default: "localhost.localdomain")
@@ -31,20 +35,20 @@ type Server struct {
 	// New e-mails are handed off to this function.
 	// Can be left empty for a NOOP server.
 	// If an error is returned, it will be reported in the SMTP session.
-	Handler func(peer Peer, env Envelope) error
+	Handler func(peer *SessionContext, env Envelope) error
 
 	// Enable various checks during the SMTP session.
 	// Can be left empty for no restrictions.
 	// If an error is returned, it will be reported in the SMTP session.
 	// Use the Error struct for access to error codes.
-	ConnectionChecker func(peer Peer) error              // Called upon new connection.
-	HeloChecker       func(peer Peer, name string) error // Called after HELO/EHLO.
-	SenderChecker     func(peer Peer, addr string) error // Called after MAIL FROM.
-	RecipientChecker  func(peer Peer, addr string) error // Called after each RCPT TO.
-
+	ConnectionChecker func(peer *SessionContext) error              // Called upon new connection.
+	HeloChecker       func(peer *SessionContext, name string) error // Called after HELO/EHLO.
+	SenderChecker     func(peer *SessionContext, addr string) error // Called after MAIL FROM.
+	RecipientChecker  func(peer *SessionContext, addr string) error // Called after each RCPT TO.
+	QuitHandler       func(peer *SessionContext)                    // Called when the connection is being closed
 	// Enable PLAIN/LOGIN authentication, only available after STARTTLS.
 	// Can be left empty for no authentication support.
-	Authenticator func(peer Peer, username, password string) error
+	Authenticator func(peer *SessionContext, username, password string) error
 
 	EnableXCLIENT       bool // Enable XCLIENT support (default: false)
 	EnableProxyProtocol bool // Enable proxy protocol support (default: false)
@@ -52,7 +56,7 @@ type Server struct {
 	TLSConfig *tls.Config // Enable STARTTLS support.
 	ForceTLS  bool        // Force STARTTLS usage.
 
-	ProtocolLogger *log.Logger
+	ProtocolLogger Log
 
 	// mu guards doneChan and makes closing it and listener atomic from
 	// perspective of Serve()
@@ -74,8 +78,8 @@ const (
 	ESMTP = "ESMTP"
 )
 
-// Peer represents the client connecting to the server
-type Peer struct {
+// SessionContext represents the client connecting to the server
+type SessionContext struct {
 	HeloName     string               // Server name used in HELO/EHLO command
 	Username     string               // Username from authentication, if authenticated
 	Password     string               // Password from authentication, if authenticated
@@ -84,6 +88,7 @@ type Peer struct {
 	Addr         net.Addr             // Network address
 	TLS          *tls.ConnectionState // TLS Connection details, if on TLS
 	ConnectionID string               // UUID for each connection
+	Data         map[string]any       //Context value map - destroyed on close
 }
 
 // Error represents an Error reported in the SMTP session.
@@ -102,7 +107,7 @@ var ErrServerClosed = errors.New("smtp: Server closed")
 type session struct {
 	server *Server
 
-	peer     Peer
+	peer     *SessionContext
 	envelope *Envelope
 
 	conn net.Conn
@@ -121,15 +126,16 @@ func (srv *Server) newSession(c net.Conn) (s *session) {
 		conn:   c,
 		reader: bufio.NewReader(c),
 		writer: bufio.NewWriter(c),
-		peer: Peer{
+		peer: &SessionContext{
 			ConnectionID: uuid.NewString(),
 			Addr:         c.RemoteAddr(),
 			ServerName:   srv.Hostname,
+			Data:         map[string]any{},
 		},
 	}
 
 	// Check if the underlying connection is already TLS.
-	// This will happen if the Listerner provided Serve()
+	// This will happen if the Listener provided Serve()
 	// is from tls.Listen()
 
 	var tlsConn *tls.Conn
@@ -193,7 +199,7 @@ func (srv *Server) Serve(l net.Listener) error {
 			default:
 			}
 
-			if ne, ok := e.(net.Error); ok && ne.Temporary() {
+			if ne, ok := e.(net.Error); ok && ne.Timeout() {
 				time.Sleep(time.Second)
 				continue
 			}
@@ -387,11 +393,11 @@ func (session *session) logf(format string, v ...interface{}) {
 	if session.server.ProtocolLogger == nil {
 		return
 	}
-	session.server.ProtocolLogger.Output(2, fmt.Sprintf(
+	session.server.ProtocolLogger.Printf(
 		"%s [peer:%s]",
 		fmt.Sprintf(format, v...),
 		session.peer.Addr,
-	))
+	)
 
 }
 
@@ -431,38 +437,45 @@ func (session *session) deliver() error {
 }
 
 func (session *session) close() {
+
 	session.writer.Flush()
 	time.Sleep(200 * time.Millisecond)
+	if session.server.QuitHandler != nil {
+		session.server.QuitHandler(session.peer)
+	}
+	for k := range session.peer.Data {
+		delete(session.peer.Data, k)
+	}
 	session.conn.Close()
 }
 
 // From net/http/server.go
 
-func (s *Server) shuttingDown() bool {
-	return s.inShutdown.isSet()
+func (srv *Server) shuttingDown() bool {
+	return srv.inShutdown.isSet()
 }
 
-func (s *Server) getDoneChan() <-chan struct{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.getDoneChanLocked()
+func (srv *Server) getDoneChan() <-chan struct{} {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return srv.getDoneChanLocked()
 }
 
-func (s *Server) getDoneChanLocked() chan struct{} {
-	if s.doneChan == nil {
-		s.doneChan = make(chan struct{})
+func (srv *Server) getDoneChanLocked() chan struct{} {
+	if srv.doneChan == nil {
+		srv.doneChan = make(chan struct{})
 	}
-	return s.doneChan
+	return srv.doneChan
 }
 
-func (s *Server) closeDoneChanLocked() {
-	ch := s.getDoneChanLocked()
+func (srv *Server) closeDoneChanLocked() {
+	ch := srv.getDoneChanLocked()
 	select {
 	case <-ch:
 		// Already closed. Don't close again.
 	default:
 		// Safe to close here. We're the only closer, guarded
-		// by s.mu.
+		// by srv.mu.
 		close(ch)
 	}
 }
